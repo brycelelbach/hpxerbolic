@@ -3,13 +3,17 @@
 //  Distributed under the Boost Software License, Version 1.0. (See accompanying
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#include <hpx/hpx_fwd.hpp>
-#include <hpx/hpx_main.hpp>
-#include <hpx/lcos/when_all.hpp>
-#include <hpx/include/local_lcos.hpp>
-#include <hpx/util/unwrapped.hpp>
+#define HPX_LIMIT 8
 
-#define UW hpx::util::unwrapped2
+#include <hpx/hpx.hpp>
+#include <hpx/hpx_main.hpp>
+//#include <hpx/hpx_fwd.hpp>
+//#include <hpx/lcos/when_all.hpp>
+//#include <hpx/include/local_lcos.hpp>
+//#include <hpx/util/unwrapped.hpp>
+
+#define UW hpx::util::unwrapped
+#define UW2 hpx::util::unwrapped2
 
 // Simulates gas flow inside of a tube that is surrounded by an environment
 // that maintains a constant temperature everywhere. Entropy is also assumed to
@@ -87,7 +91,7 @@ struct solver
     // Advection, then source terms (just pressure for us).
     static constexpr coord substeps = 2;
 
-    // CFL parameters (sterotypical LSU physics department paranoia applied).
+    // CFL parameters.
     static constexpr double init_dt           = 0.1;  // Initial timestep size.
     static constexpr double dt_growth_limiter = 1.25; // Max timestep size growth per step.
     static constexpr double C                 = 0.4;  // Courant number.
@@ -120,7 +124,7 @@ struct solver
     };
 
     // Compute the numerical flux at the left interface using the donor-cell scheme.
-    state flux(state left, state middle) {
+    static state flux(state left, state middle) {
         if ((middle.type & LEFT) || (middle.type == RIGHT_OUTSIDE)) {
             return state(0.0, 0.0, middle.type);
         }
@@ -142,7 +146,7 @@ struct solver
     // We assume that the pressure outside the tube is equal to the pressure at
     // the boundary (e.g. reflecting boundary conditions); we're not using
     // ghost zones so we must add a 1/2 factor for the boundaries.
-    double pressure(state left, state middle, state right) {
+    static double pressure(state left, state middle, state right) {
         if      (middle.type == LEFT_BOUNDARY)
             return 0.25 * (gamma-1.0)*(right.rho-middle.rho);
         else if (middle.type == RIGHT_BOUNDARY)
@@ -152,7 +156,7 @@ struct solver
     };
 
     // Update for donor-cell advection.
-    state advection(double dt, state left, state middle, state right) {
+    static state advection(double dt, state left, state middle, state right) {
         state fl_middle = flux(left, middle);  // F[t-1][i]
         state fl_right  = flux(middle, right); // F[t-1][i+1]
 
@@ -162,7 +166,7 @@ struct solver
     };
 
     // Update for sources.
-    state sources(double dt, state left, state middle, state right) {
+    static state sources(double dt, state left, state middle, state right) {
         double mom = middle.mom - (dt/dx)*pressure(left, middle, right);
         return state(middle.rho, mom, middle.type); // U[t+2][i] 
     };
@@ -226,7 +230,9 @@ struct solver
     hpx::future<space> solve() { 
         for (coord t = 2; t < nT*substeps; t += 2) {
             coord T = t/2; // t = substep, T = step
-    
+
+            using hpx::lcos::local::dataflow;   
+ 
             ///////////////////////////////////////////////////////////////////
             // Compute next timestep size
 
@@ -235,7 +241,7 @@ struct solver
             // from overlapping the computation of multiple timesteps. 
             CFL_dt[T] =
                 hpx::when_all(U[t-1])
-                    .then(UW(
+                    .then(UW2(
                         boost::bind(&solver::enforce_cfl, this, T, _1)
                      ));
     
@@ -245,47 +251,47 @@ struct solver
             for (coord i = 1; i < nx - 1; ++i)
                 U[t][i] =
                     hpx::when_all(CFL_dt[T], U[t-1][i-1], U[t-1][i], U[t-1][i+1])
-                        .then(UW(
-                            boost::bind(&solver::advection, this, _1, _2, _3, _4)
+                        .then(UW2(
+                            &advection
                          ));
     
             // Boundary conditions
     
             U[t][0]    = 
                 hpx::when_all(CFL_dt[T], ready(LEFT_OUTSIDE), U[t-1][0], U[t-1][1])
-                    .then(UW(
-                        boost::bind(&solver::advection, this, _1, _2, _3, _4)
+                    .then(UW2(
+                        &advection
                      ));
     
             U[t][nx-1] =
                 hpx::when_all(CFL_dt[T], U[t-1][nx-2], U[t-1][nx-1], ready(RIGHT_OUTSIDE))
-                    .then(UW(
-                        boost::bind(&solver::advection, this, _1, _2, _3, _4)
+                    .then(UW2(
+                        &advection
                      ));
     
             ///////////////////////////////////////////////////////////////////
             // Sources Step : t -> t+1
  
             for (coord i = 1; i < nx - 1; ++i)
-                U[t+1][i] =
-                    hpx::when_all(CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1])
-                        .then(UW(
-                            boost::bind(&solver::sources, this, _1, _2, _3, _4)
-                        )); 
+                U[t+1][i] = dataflow(UW(&sources), CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1]);
+//                    hpx::when_all(CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1])
+//                        .then(UW(
+//                            &sources
+//                        )); 
 
             // Boundary conditions
     
-            U[t+1][0]    = 
-                hpx::when_all(CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1])
-                    .then(UW(
-                        boost::bind(&solver::sources, this, _1, _2, _3, _4)
-                    )); 
+            U[t+1][0]    = dataflow(UW(&sources), CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1]);
+//                hpx::when_all(CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1])
+//                    .then(UW(
+//                        &sources
+//                    )); 
     
-            U[t+1][nx-1] =
-                hpx::when_all(CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE))
-                    .then(UW(
-                        boost::bind(&solver::sources, this, _1, _2, _3, _4)
-                    )); 
+            U[t+1][nx-1] = dataflow(UW(&sources), CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE));
+//                hpx::when_all(CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE))
+//                    .then(UW(
+//                        &sources
+//                    )); 
         }
 
         return state_solution(nT-1);
