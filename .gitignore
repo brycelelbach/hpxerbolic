@@ -1,4 +1,4 @@
 1d_isothermal_flow
-*.dat
-*.mpeg
+./*.dat
+./*.mpeg
 scratch/
