@@ -173,10 +173,11 @@ struct solver
 
     ///////////////////////////////////////////////////////////////////////////
 
-    template <typename F>
-    void initial_conditions(F f) {
+    // Generate the initial state, using a user-supplied function 'ic'
+    template <typename IC>
+    void initial_conditions(IC ic) {
         for (coord i = 0; i < nx; ++i) {
-            state ui = f(i, nx);
+            state ui = ic(i, nx);
             if (i == 0)    ui.type = LEFT_BOUNDARY;
             if (i == nx-1) ui.type = RIGHT_BOUNDARY;
             U[0][i] = U[1][i] = hpx::make_ready_future(ui);
@@ -239,59 +240,45 @@ struct solver
             // The CFL condition imposes an implicit global barrier; in a code
             // like this, it is the only timestep-wide dependency preventing us
             // from overlapping the computation of multiple timesteps. 
-            CFL_dt[T] =
-                hpx::when_all(U[t-1])
-                    .then(UW2(
-                        boost::bind(&solver::enforce_cfl, this, T, _1)
-                     ));
+            CFL_dt[T] = dataflow(
+                            UW(boost::bind(&solver::enforce_cfl, this, T, _1))
+                          , U[t-1]); // Dependencies
     
             ///////////////////////////////////////////////////////////////////
             // Advection step: t-1 -> t
     
             for (coord i = 1; i < nx - 1; ++i)
-                U[t][i] =
-                    hpx::when_all(CFL_dt[T], U[t-1][i-1], U[t-1][i], U[t-1][i+1])
-                        .then(UW2(
-                            &advection
-                         ));
+                U[t][i] = dataflow(
+                    UW(&advection)
+                  , CFL_dt[T], U[t-1][i-1], U[t-1][i], U[t-1][i+1]); // Dependencies 
     
             // Boundary conditions
     
-            U[t][0]    = 
-                hpx::when_all(CFL_dt[T], ready(LEFT_OUTSIDE), U[t-1][0], U[t-1][1])
-                    .then(UW2(
-                        &advection
-                     ));
+            U[t][0]    = dataflow(
+                            UW(&advection),
+                            CFL_dt[T], ready(LEFT_OUTSIDE), U[t-1][0], U[t-1][1]); // Dependencies
     
-            U[t][nx-1] =
-                hpx::when_all(CFL_dt[T], U[t-1][nx-2], U[t-1][nx-1], ready(RIGHT_OUTSIDE))
-                    .then(UW2(
-                        &advection
-                     ));
+            U[t][nx-1] = dataflow(
+                            UW(&advection),
+                            CFL_dt[T], U[t-1][nx-2], U[t-1][nx-1], ready(RIGHT_OUTSIDE)); // Dependencies
     
             ///////////////////////////////////////////////////////////////////
             // Sources Step : t -> t+1
  
             for (coord i = 1; i < nx - 1; ++i)
-                U[t+1][i] = dataflow(UW(&sources), CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1]);
-//                    hpx::when_all(CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1])
-//                        .then(UW(
-//                            &sources
-//                        )); 
+                U[t+1][i] = dataflow(
+                                UW(&sources),
+                                CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1]); // Dependencies
 
             // Boundary conditions
     
-            U[t+1][0]    = dataflow(UW(&sources), CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1]);
-//                hpx::when_all(CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1])
-//                    .then(UW(
-//                        &sources
-//                    )); 
+            U[t+1][0]    = dataflow(
+                                UW(&sources),
+                                CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1]); // Dependencies
     
-            U[t+1][nx-1] = dataflow(UW(&sources), CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE));
-//                hpx::when_all(CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE))
-//                    .then(UW(
-//                        &sources
-//                    )); 
+            U[t+1][nx-1] = dataflow(
+                                UW(&sources),
+                                CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE)); // Dependencies
         }
 
         return state_solution(nT-1);
