@@ -1,4 +1,9 @@
 1d_isothermal_flow
-./*.dat
-./*.mpeg
 scratch/
+dt_hpx.dat
+dt_hpx.png
+U_hpx.dat
+U_hpx_mom.png
+U_hpx.mpeg
+U_hpx_rho.png
+U_hpx_vel.png
