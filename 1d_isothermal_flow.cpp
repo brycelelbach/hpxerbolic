@@ -7,13 +7,8 @@
 
 #include <hpx/hpx.hpp>
 #include <hpx/hpx_main.hpp>
-//#include <hpx/hpx_fwd.hpp>
-//#include <hpx/lcos/when_all.hpp>
-//#include <hpx/include/local_lcos.hpp>
-//#include <hpx/util/unwrapped.hpp>
 
 #define UW hpx::util::unwrapped
-#define UW2 hpx::util::unwrapped2
 
 // Simulates gas flow inside of a tube that is surrounded by an environment
 // that maintains a constant temperature everywhere. Entropy is also assumed to
@@ -84,8 +79,12 @@ hpx::future<state> ready(cell_type t) {
 struct solver
 {
     typedef std::vector<hpx::shared_future<state> > space; 
-    typedef std::vector<space> spacetime; 
-    typedef std::vector<hpx::shared_future<double> > timestep_sizes;
+    typedef hpx::shared_future<double> timestep_size;
+
+    struct solution {
+        space U;
+        timestep_size dt;
+    };
 
     // Number of substeps. We have two here (due to operator splitting);
     // Advection, then source terms (just pressure for us).
@@ -101,16 +100,23 @@ struct solver
     static constexpr double gamma = 7.0/5.0; // Pressure constant.
 
   private:
-    coord nx; // Number of grid points; 0-indexed.
-    coord nT; // Number of steps; 1-indexed (T=0 is initial state).
+    const coord nx; // Number of grid points; 0-indexed.
+    space U;        // U[i] is the state of position i 
 
-    spacetime U; // U[t][i] is the state of position i at substep t.
-
-    timestep_sizes CFL_dt; // CFL_dt[T] is the timestep size (dt) for step T. 
+    timestep_size cfl_dt; // The timestep size (dt).
 
   public:
-    solver(coord nx_, coord nT_) : nx(nx_), nT(nT_ + 1), U(nT*substeps), CFL_dt(nT) {
-        for (space& s : U) s.resize(nx);
+    // Generate the initial state, using a user-supplied initialization function.
+    template <typename IC>
+    solver(coord nx_, IC ic) : nx(nx_), U(nx) {
+        for (coord i = 0; i < nx; ++i) {
+            state ui = ic(i, nx);
+            if (i == 0)    ui.type = LEFT_BOUNDARY;
+            if (i == nx-1) ui.type = RIGHT_BOUNDARY;
+            U[i] = hpx::make_ready_future(ui);
+        }
+
+        cfl_dt = hpx::make_ready_future(C*init_dt);
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -173,27 +179,13 @@ struct solver
 
     ///////////////////////////////////////////////////////////////////////////
 
-    // Generate the initial state, using a user-supplied function 'ic'
-    template <typename IC>
-    void initial_conditions(IC ic) {
-        for (coord i = 0; i < nx; ++i) {
-            state ui = ic(i, nx);
-            if (i == 0)    ui.type = LEFT_BOUNDARY;
-            if (i == nx-1) ui.type = RIGHT_BOUNDARY;
-            U[0][i] = U[1][i] = hpx::make_ready_future(ui);
-        }
-
-        CFL_dt[0] = hpx::make_ready_future(C*init_dt);
-    }
-
-    ///////////////////////////////////////////////////////////////////////////
-
     // Select a timestep size that enforces the CFL condition.
-    double enforce_cfl(double T, std::vector<state> const& u) {
+    static double enforce_cfl(double last_dt, space const& u) {
         double min_dt = 10000.0;
 
-        for (coord i = 1; i < nx; ++i) {
-            double v = std::fabs(velocity(u[i-1], u[i]));
+        for (coord i = 1; i < u.size(); ++i) {
+            // These calls to .get() won't block; the futures should be ready.
+            double v = std::fabs(velocity(u[i-1].get(), u[i].get()));
 
             if (std::fabs(v-0.0) < 1e-16) // v == 0
                 continue;
@@ -203,130 +195,121 @@ struct solver
             min_dt = std::fmin(dx/(std::fabs(cs)+v), min_dt);
         }
 
-        // We must divide out the courant number from last_dt. The .get here
-        // will not wait; it's a dependency of our dependency.
-        double last_dt = CFL_dt[T-1].get()/C; 
-
-        double dt = C*std::fmin(min_dt, last_dt*dt_growth_limiter);
+        // We must divide out the Courant number from last_dt.
+        double dt = C*std::fmin(min_dt, (last_dt/C)*dt_growth_limiter);
 
         return dt; 
     }
 
     ///////////////////////////////////////////////////////////////////////////
 
-    // Retrieve a future referring to the state at time T.
-    hpx::future<space> state_solution(coord T) {
-        HPX_ASSERT((T >= 0)); HPX_ASSERT(T < nT);
-        coord t = T*2-1; // t = substep, T = step; remember T is 1-indexed.
-        return hpx::when_all(U[t]);
-    } 
-
-    // Retrieve a future referring to the timestep size at time T.
-    hpx::shared_future<double> cfl_solution(coord T) {
-        HPX_ASSERT((T >= 0)); HPX_ASSERT(T < nT);
-        return CFL_dt[T]; 
-    } 
-
     // Dataflow-style solver.
-    hpx::future<space> solve() { 
-        for (coord t = 2; t < nT*substeps; t += 2) {
-            coord T = t/2; // t = substep, T = step
+    solution step() { 
+        using hpx::lcos::local::dataflow;   
+        using hpx::util::unwrapped;
+        using hpx::util::unwrapped2;
 
-            using hpx::lcos::local::dataflow;   
- 
-            ///////////////////////////////////////////////////////////////////
-            // Compute next timestep size
+        // Operators
+        auto EnforceCFL = unwrapped(&enforce_cfl);
+        auto Advection  = unwrapped(&advection);
+        auto Sources    = unwrapped(&sources); 
 
-            // The CFL condition imposes an implicit global barrier; in a code
-            // like this, it is the only timestep-wide dependency preventing us
-            // from overlapping the computation of multiple timesteps. 
-            CFL_dt[T] = dataflow(
-                            UW(boost::bind(&solver::enforce_cfl, this, T, _1))
-                          , U[t-1]); // Dependencies
-    
-            ///////////////////////////////////////////////////////////////////
-            // Advection step: t-1 -> t
-    
-            for (coord i = 1; i < nx - 1; ++i)
-                U[t][i] = dataflow(
-                    UW(&advection)
-                  , CFL_dt[T], U[t-1][i-1], U[t-1][i], U[t-1][i+1]); // Dependencies 
-    
-            // Boundary conditions
-    
-            U[t][0]    = dataflow(
-                            UW(&advection),
-                            CFL_dt[T], ready(LEFT_OUTSIDE), U[t-1][0], U[t-1][1]); // Dependencies
-    
-            U[t][nx-1] = dataflow(
-                            UW(&advection),
-                            CFL_dt[T], U[t-1][nx-2], U[t-1][nx-1], ready(RIGHT_OUTSIDE)); // Dependencies
-    
-            ///////////////////////////////////////////////////////////////////
-            // Sources Step : t -> t+1
- 
-            for (coord i = 1; i < nx - 1; ++i)
-                U[t+1][i] = dataflow(
-                                UW(&sources),
-                                CFL_dt[T], U[t][i-1], U[t][i], U[t][i+1]); // Dependencies
+        ///////////////////////////////////////////////////////////////////
+        // Compute next timestep size
 
-            // Boundary conditions
-    
-            U[t+1][0]    = dataflow(
-                                UW(&sources),
-                                CFL_dt[T], ready(LEFT_OUTSIDE), U[t][0], U[t][1]); // Dependencies
-    
-            U[t+1][nx-1] = dataflow(
-                                UW(&sources),
-                                CFL_dt[T], U[t][nx-2], U[t][nx-1], ready(RIGHT_OUTSIDE)); // Dependencies
-        }
+        // The CFL condition imposes an implicit global barrier; in a code
+        // like this, it is the only timestep-wide dependency preventing us
+        // from overlapping the computation of multiple timesteps. 
+        cfl_dt = dataflow(EnforceCFL, cfl_dt, hpx::when_all(U)); 
 
-        return state_solution(nT-1);
+        ///////////////////////////////////////////////////////////////////
+        // Advection step: T -> T+(1/2)
+
+        for (coord i = 1; i < nx - 1; ++i)
+            U[i] = dataflow(Advection, cfl_dt, U[i-1], U[i], U[i+1]); 
+    
+        // Boundary conditions
+        U[0]    = dataflow(Advection, cfl_dt, ready(LEFT_OUTSIDE), U[0], U[1]); 
+        U[nx-1] = dataflow(Advection, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE)); 
+    
+        ///////////////////////////////////////////////////////////////////
+        // Sources Step : T+(1/2) -> T
+
+        for (coord i = 1; i < nx - 1; ++i)
+            U[i] = dataflow(Sources, cfl_dt, U[i-1], U[i], U[i+1]);
+
+        // Boundary conditions
+        U[0]    = dataflow(Sources, cfl_dt, ready(LEFT_OUTSIDE), U[0], U[1]);
+        U[nx-1] = dataflow(Sources, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE)); 
+
+        return solution{U, cfl_dt};
     }
 };
-
 
 int main()
 {
     coord nx = 100;
-    coord nT = 400;
+    coord nT = 1000;
 
-    solver s(nx, nT);
-
-    // Gaussian density distribution at rest (e.g. no initial momentum).
-    s.initial_conditions(
-        [] (coord i, coord max) {
-            double const xmid = double(max-1)/2.0;
-            double rho = 1.0 + 0.3*std::exp(-std::pow(i-xmid, 2)/std::pow(0.1*(max-1), 2));
+    solver sim(nx,
+        // Gaussian density distribution at rest (e.g. no initial momentum).
+        [] (coord i, coord nx) {
+            double xmid = double(nx-1)/2.0;
+            double dg = std::pow(0.1*(nx-1), 2);
+            double rho = 1.0 + 0.3*std::exp(-std::pow(i-xmid, 2)/dg);
             return state(rho, 0.0); 
         }
     ); 
 
-    s.solve();
+    // This future is used to serialize I/O; any operation that writes to a file
+    // will attach itself to the end of the chain.
+    hpx::future<void> io_chain = hpx::make_ready_future(); 
 
     std::ofstream U_out("U_hpx.dat");
     std::ofstream dt_out("dt_hpx.dat");
 
     for (coord T = 1; T < nT; ++T) {
-        ///////////////////////////////////////////////////////////////////////
-        // Write a block of state records
+        solver::solution S = sim.step();
 
-        solver::space u = s.state_solution(T).get();
+        using hpx::lcos::local::dataflow;
+        using hpx::util::unwrapped;
+        using hpx::util::unwrapped2;
 
-        for (coord i = 0; i < u.size(); ++i) {
-            state ui = u[i].get(); // Won't block; always ready.
-            double v = (i != 0) ? solver::velocity(u[i-1].get(), ui) : 0; 
-            U_out << (boost::format("%i %i %.12g %.12g %.12g\n") % T % i % ui.rho % ui.mom % v);
-        }
+        // Attach asynchronous output operations to the computational tree.
+        io_chain = dataflow(unwrapped2(
+            [T, &U_out] (std::vector<state> const& u) { 
+                // Write a state record.
+                for (coord i = 0; i < u.size(); ++i) {
+                    state ui = u[i];
+                    double v = (i != 0) ? solver::velocity(u[i-1], ui) : 0; 
+                    U_out << ( boost::format("%i %i %.12g %.12g %.12g\n")
+                             % T % i % ui.rho % ui.mom % v);
+                }
 
-        U_out << "\n";
+                U_out << "\n";
+            }),
+            hpx::when_all(S.U),
+            std::move(io_chain)
+        );
 
-        ///////////////////////////////////////////////////////////////////////
-        // Write a dt record
+        io_chain = dataflow(unwrapped(
+            [T, &dt_out] (double dt) { 
+                // Write a timestep size record.
+                dt_out << (boost::format("%i %.12g\n") % T % dt);
 
-        dt_out << (boost::format("%i %.12g\n") % T % s.cfl_solution(T).get());
-        std::cout << (boost::format("STEP %i DT %.12g\n") % T % s.cfl_solution(T).get());
+                std::cout << (boost::format("STEP %i DT %.12g\n") % T % dt);
+
+                if ((dt <= 1e-8) || (dt >= 1e8)) 
+                    std::cout << "ERROR: Timestep size is outside of tolerance, "
+                                 "numeric instability suspected\n";
+            }),
+            S.dt,
+            std::move(io_chain)
+        );
     }
+
+    // Now, we wait.
+    io_chain.get();
 
     return 0;
 }
