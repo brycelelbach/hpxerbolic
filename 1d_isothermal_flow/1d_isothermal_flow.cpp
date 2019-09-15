@@ -30,7 +30,7 @@
 // We solve this system using explicit finite differencing methods and an
 // operator-splitting approach; first advection is performed, and then source
 // terms. We use a simple donor-cell upwind scheme for advection; it is 1st
-// order in time and space. 
+// order in time and space.
 //
 // Currently, the initial conditions are a gaussian density distribution at rest.
 // Reflecting boundary conditions are used (e.g. closed tube). According to my
@@ -41,14 +41,14 @@
 //
 // References: "Numerical Methods for Conservation Laws" (LeVeque), Lecture Notes
 // of C.P. Dullemond/R. Kuiper.
- 
+
 ///////////////////////////////////////////////////////////////////////////////
 
 typedef std::size_t coord;
 
 enum cell_type
 {
-    INTERIOR = 0,  // Interior grid point. 
+    INTERIOR = 0,  // Interior grid point.
 
     LEFT     = (1<<0),
     RIGHT    = (1<<1),
@@ -61,7 +61,7 @@ enum cell_type
     RIGHT_OUTSIDE   = (RIGHT | OUTSIDE)   // Outside the domain, to the right.
 };
 
-struct state 
+struct state
 {
     double rho;     // Density.
     double mom;     // Momentum.
@@ -78,7 +78,7 @@ hpx::future<state> ready(cell_type t) {
 
 struct solver
 {
-    typedef std::vector<hpx::shared_future<state> > space; 
+    typedef std::vector<hpx::shared_future<state> > space;
     typedef hpx::shared_future<double> timestep_size;
 
     struct solution {
@@ -101,7 +101,7 @@ struct solver
 
   private:
     const coord nx; // Number of grid points; 0-indexed.
-    space U;        // U[i] is the state of position i 
+    space U;        // U[i] is the state of position i
 
     timestep_size cfl_dt; // The timestep size (dt).
 
@@ -122,9 +122,9 @@ struct solver
     ///////////////////////////////////////////////////////////////////////////
     // Operators
 
-    // Compute velocity at left cell interfaces by arithmetic mean. 
+    // Compute velocity at left cell interfaces by arithmetic mean.
     static double velocity(state left, state middle) {
-        double v_left   = left.mom/left.rho; 
+        double v_left   = left.mom/left.rho;
         double v_middle = middle.mom/middle.rho;
         return 0.5*(v_middle+v_left);
     };
@@ -140,11 +140,11 @@ struct solver
         if (v > 0.0) {
             double fluxrho = left.rho*v;
             double fluxmom = (std::pow(left.mom, 2))/left.rho;
-            return state(fluxrho, fluxmom, middle.type); 
+            return state(fluxrho, fluxmom, middle.type);
         } else {
             double fluxrho = middle.rho*v;
             double fluxmom = (std::pow(middle.mom, 2))/middle.rho;
-            return state(fluxrho, fluxmom, middle.type); 
+            return state(fluxrho, fluxmom, middle.type);
         }
     }
 
@@ -157,7 +157,7 @@ struct solver
             return 0.25 * (gamma-1.0)*(right.rho-middle.rho);
         else if (middle.type == RIGHT_BOUNDARY)
             return 0.25 * (gamma-1.0)*(middle.rho-left.rho);
-        else 
+        else
             return 0.5 * (gamma-1.0)*(right.rho-left.rho);
     };
 
@@ -168,13 +168,13 @@ struct solver
 
         double rho = middle.rho - (dt/dx)*(fl_right.rho-fl_middle.rho);
         double mom = middle.mom - (dt/dx)*(fl_right.mom-fl_middle.mom);
-        return state(rho, mom, middle.type); // U[t+1][i] 
+        return state(rho, mom, middle.type); // U[t+1][i]
     };
 
     // Update for sources.
     static state sources(double dt, state left, state middle, state right) {
         double mom = middle.mom - (dt/dx)*pressure(left, middle, right);
-        return state(middle.rho, mom, middle.type); // U[t+2][i] 
+        return state(middle.rho, mom, middle.type); // U[t+2][i]
     };
 
     ///////////////////////////////////////////////////////////////////////////
@@ -198,49 +198,49 @@ struct solver
         // We must divide out the Courant number from last_dt.
         double dt = C*std::fmin(min_dt, (last_dt/C)*dt_growth_limiter);
 
-        return dt; 
+        return dt;
     }
 
     ///////////////////////////////////////////////////////////////////////////
 
     // Dataflow-style solver.
-    solution step() { 
-        using hpx::lcos::local::dataflow;   
+    solution step() {
+        using hpx::lcos::local::dataflow;
         using hpx::util::unwrapped;
         using hpx::util::unwrapped2;
 
         // Operators
         auto EnforceCFL = unwrapped(&enforce_cfl);
         auto Advection  = unwrapped(&advection);
-        auto Sources    = unwrapped(&sources); 
+        auto Sources    = unwrapped(&sources);
 
         ///////////////////////////////////////////////////////////////////
         // Compute next timestep size
 
         // The CFL condition imposes an implicit global barrier; in a code
         // like this, it is the only timestep-wide dependency preventing us
-        // from overlapping the computation of multiple timesteps. 
-        cfl_dt = dataflow(EnforceCFL, cfl_dt, hpx::when_all(U)); 
+        // from overlapping the computation of multiple timesteps.
+        cfl_dt = dataflow(EnforceCFL, cfl_dt, hpx::when_all(U));
 
         ///////////////////////////////////////////////////////////////////
         // Advection step: T -> T+(1/2)
 
         for (coord i = 1; i < nx - 1; ++i)
-            U[i] = dataflow(Advection, cfl_dt, U[i-1], U[i], U[i+1]); 
-    
+            U[i] = dataflow(Advection, cfl_dt, U[i-1], U[i], U[i+1]);
+
         // Boundary conditions
-        U[0]    = dataflow(Advection, cfl_dt, ready(LEFT_OUTSIDE), U[0], U[1]); 
-        U[nx-1] = dataflow(Advection, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE)); 
-    
+        U[0]    = dataflow(Advection, cfl_dt, ready(LEFT_OUTSIDE), U[0], U[1]);
+        U[nx-1] = dataflow(Advection, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE));
+
         ///////////////////////////////////////////////////////////////////
-        // Sources Step : T+(1/2) -> T
+        // Sources Step : T+(1/2) -> T+1
 
         for (coord i = 1; i < nx - 1; ++i)
             U[i] = dataflow(Sources, cfl_dt, U[i-1], U[i], U[i+1]);
 
         // Boundary conditions
         U[0]    = dataflow(Sources, cfl_dt, ready(LEFT_OUTSIDE), U[0], U[1]);
-        U[nx-1] = dataflow(Sources, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE)); 
+        U[nx-1] = dataflow(Sources, cfl_dt, U[nx-2], U[nx-1], ready(RIGHT_OUTSIDE));
 
         return solution{U, cfl_dt};
     }
@@ -257,13 +257,13 @@ int main()
             double xmid = double(nx-1)/2.0;
             double dg = std::pow(0.1*(nx-1), 2);
             double rho = 1.0 + 0.3*std::exp(-std::pow(i-xmid, 2)/dg);
-            return state(rho, 0.0); 
+            return state(rho, 0.0);
         }
-    ); 
+    );
 
     // This future is used to serialize I/O; any operation that writes to a file
     // will attach itself to the end of the chain.
-    hpx::future<void> io_chain = hpx::make_ready_future(); 
+    hpx::future<void> io_chain = hpx::make_ready_future();
 
     std::ofstream U_out("U_hpx.dat");
     std::ofstream dt_out("dt_hpx.dat");
@@ -277,11 +277,11 @@ int main()
 
         // Attach asynchronous output operations to the computational tree.
         io_chain = dataflow(unwrapped2(
-            [T, &U_out] (std::vector<state> const& u) { 
+            [T, &U_out] (std::vector<state> const& u) {
                 // Write a state record.
                 for (coord i = 0; i < u.size(); ++i) {
                     state ui = u[i];
-                    double v = (i != 0) ? solver::velocity(u[i-1], ui) : 0; 
+                    double v = (i != 0) ? solver::velocity(u[i-1], ui) : 0;
                     U_out << ( boost::format("%i %i %.12g %.12g %.12g\n")
                              % T % i % ui.rho % ui.mom % v);
                 }
@@ -293,13 +293,13 @@ int main()
         );
 
         io_chain = dataflow(unwrapped(
-            [T, &dt_out] (double dt) { 
+            [T, &dt_out] (double dt) {
                 // Write a timestep size record.
                 dt_out << (boost::format("%i %.12g\n") % T % dt);
 
                 std::cout << (boost::format("STEP %i DT %.12g\n") % T % dt);
 
-                if ((dt <= 1e-8) || (dt >= 1e8)) 
+                if ((dt <= 1e-8) || (dt >= 1e8))
                     std::cout << "ERROR: Timestep size is outside of tolerance, "
                                  "numeric instability suspected\n";
             }),
